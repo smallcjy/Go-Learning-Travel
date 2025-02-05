@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-
-	"6.5840/mr"
 )
 
 const (
@@ -187,15 +185,15 @@ func DoReduce(taskinfo *TaskInfo, reducef func(string, []string) string, wg *syn
 	wg.Done();
 }
 
-func Map(filename string, contents string) []mr.KeyValue {
+func Map(filename string, contents string) []KeyValue {
 	ff := func(r rune) bool { return !unicode.IsLetter(r)};
 
 	// splite content into array of words
 	words := strings.FieldsFunc(contents, ff);
 
-	kv_array := []mr.KeyValue{};
+	kv_array := []KeyValue{};
 	for _, w := range words {
-		kv := mr.KeyValue{w, "1"};
+		kv := KeyValue{w, "1"};
 		kv_array = append(kv_array, kv);
 	}
 
