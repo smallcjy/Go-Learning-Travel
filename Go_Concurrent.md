@@ -12,3 +12,25 @@ go func_name()
 ```
 
 ## Channels / 信道
+
+## Context 控制上下文
+
+
+# GO 竞态问题
+## sync.Mutex
+如果结构体内有竞态资源，需要用锁来保护
+```go
+type SafeCounter struct {
+    v   map[string]int
+    mux sync.Mutex
+}
+
+// 获取锁
+func (c *SafeCounter) Inc(key string) {
+    c.mux.Lock()
+    defer c.mux.Unlock()
+    c.v[key]++
+}
+
+```
+
