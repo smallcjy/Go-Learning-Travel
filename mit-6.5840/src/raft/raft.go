@@ -28,6 +28,12 @@ import (
 	"6.5840/labrpc"
 )
 
+// Raft state
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -50,6 +56,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term int
+	Command interface{}
+}  
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -62,6 +73,23 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentTerm 	int
+	votedFor    	int
+	logs         	[]LogEntry
+
+	commitIndex 	int
+	lastApplied 	int
+
+	nextIndex   	[]int
+	matchIndex  	[]int
+
+	applyMsgChan 	chan ApplyMsg
+	applyCond 		*sync.Cond		// condition variable to notify when a new log entry is committed
+
+	state 	 	    int
+
+	// expired timeout
+	electionExpired int64
 }
 
 // return currentTerm and whether this server
@@ -128,17 +156,130 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term 			int
+	CandidateId 	int
+	LastLogIndex 	int
+	LastLogTerm 	int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	voteResult 		bool
+	Term 			int
+}
+
+//
+// 接收到Term更大的RPC消息
+//
+func (rf *Raft) RecvNewTerm(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.state = Follower
+
+}
+
+func (rf *Raft) NewLeaderEletion(term int, lastLogIndex int, lastLogTerm int) {
+	args := &RequestVoteArgs{
+		Term: term, 
+		CandidateId: rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm: lastLogTerm,
+	}
+
+	var (
+		stop atomic.Bool
+		voteCount atomic.Int64
+	)
+	stop.Store(false)
+	voteCount.Store(int64(len(rf.peers) / 2))
+
+	for peer := range rf.peers {
+		if stop.Load() {
+			break
+		}
+
+		if peer == rf.me {
+			continue
+		}
+
+		// 并发的发送投票请求
+		go func(peer int) {
+			reply := &RequestVoteReply{}
+			ok := rf.sendRequestVote(peer, args, reply)
+			if ok {
+				// double check 
+				// 防止在此期间接受到rpc请求导致状态发生变化
+				rf.mu.Lock()
+				if rf.state != Candidate || rf.currentTerm != term {
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.Term > term {
+					rf.RecvNewTerm(reply.Term)
+					rf.mu.Unlock()
+					return
+				}
+
+				if reply.voteResult {
+					voteCount.Add(-1)
+				}
+
+				if voteCount.Load() <= 0 {
+					// begin new leader
+					rf.state = Leader
+					// renew the nextIndex and matchIndex
+					for i := range rf.peers {
+						rf.nextIndex[i] = len(rf.logs)
+						rf.matchIndex[i] = 0
+						
+						// begin log replication
+					}
+					stop.Store(true)
+					return
+				}
+			}
+		} (peer)
+
+
+	}
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// callee 的任期比 caller 的大
+	if args.Term < rf.currentTerm {
+		reply.voteResult = false
+		reply.Term = rf.currentTerm
+		return
+	} else if args.Term > rf.currentTerm {
+		rf.RecvNewTerm(args.Term)
+	} else {
+		// 同一任期，raft node在一个任期只能投给一个node
+		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (
+			(rf.logs[len(rf.logs) - 1].Term < args.LastLogTerm) || (
+				rf.logs[len(rf.logs) - 1].Term == args.LastLogTerm && len(rf.logs) - 1 <= args.LastLogIndex)) {
+			// vote true
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			rf.state = Follower
+
+			reply.voteResult = true
+			reply.Term = rf.currentTerm
+		} else {
+			reply.voteResult = false
+			reply.Term = rf.currentTerm
+		}
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -217,12 +358,28 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
+		rf.mu.Lock()
 
-		// Your code here (3A)
-		// Check if a leader election should be started.
+		if ( (rf.state == Follower || rf.state == Candidate) && time.Now().UnixMilli() > rf.electionExpired) {
+			// begin new leader selection
+			rf.state = Candidate
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.electionExpired = RandTimeStamp()
 
+			var(
+				term = rf.currentTerm
+				lastLogIndex = len(rf.logs) - 1
+				lastLogTerm = rf.logs[lastLogIndex].Term
+			)
+			rf.mu.Unlock()
 
+			go rf.NewLeaderEletion(term, lastLogIndex, lastLogTerm)
+
+		}
+
+		rf.mu.Unlock()
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
@@ -247,6 +404,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.applyMsgChan = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	
+	rf.state = Follower
+
+	rf.logs = make([]LogEntry, 1) // dummy entry at index 0, 具体作用参见论文
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+
+	rf.electionExpired = time.Now().UnixMilli() + rand.Int63n(500)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -256,4 +426,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 	return rf
+}
+
+func RandTimeStamp() int64 {
+	return time.Now().UnixNano() + rand.Int63n(500)
 }
